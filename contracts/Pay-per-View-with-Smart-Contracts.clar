@@ -160,3 +160,258 @@
         (ok true)
     )
 )
+
+(define-constant ERR-SUBSCRIPTION-EXPIRED (err u106))
+(define-constant ERR-INVALID-DURATION (err u107))
+
+(define-map creator-subscriptions
+    { creator: principal }
+    {
+        monthly-price: uint,
+        active: bool,
+        subscriber-count: uint,
+    }
+)
+
+(define-map user-subscriptions
+    {
+        user: principal,
+        creator: principal,
+    }
+    {
+        start-block: uint,
+        end-block: uint,
+        price-paid: uint,
+    }
+)
+
+(define-read-only (get-subscription-plan (creator principal))
+    (map-get? creator-subscriptions { creator: creator })
+)
+
+(define-read-only (get-user-subscription
+        (user principal)
+        (creator principal)
+    )
+    (map-get? user-subscriptions {
+        user: user,
+        creator: creator,
+    })
+)
+
+(define-read-only (is-subscription-active
+        (user principal)
+        (creator principal)
+    )
+    (match (map-get? user-subscriptions {
+        user: user,
+        creator: creator,
+    })
+        subscription (> (get end-block subscription) stacks-block-height)
+        false
+    )
+)
+
+(define-public (create-subscription-plan (monthly-price uint))
+    (begin
+        (asserts! (> monthly-price u0) ERR-INVALID-AMOUNT)
+        (map-set creator-subscriptions { creator: tx-sender } {
+            monthly-price: monthly-price,
+            active: true,
+            subscriber-count: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-public (subscribe-to-creator
+        (creator principal)
+        (duration-blocks uint)
+    )
+    (let (
+            (subscription-plan (unwrap! (map-get? creator-subscriptions { creator: creator })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (existing-subscription (map-get? user-subscriptions {
+                user: tx-sender,
+                creator: creator,
+            }))
+            (start-block (match existing-subscription
+                sub (if (> (get end-block sub) stacks-block-height)
+                    (get end-block sub)
+                    stacks-block-height
+                )
+                stacks-block-height
+            ))
+        )
+        (asserts! (get active subscription-plan) ERR-CONTENT-NOT-FOUND)
+        (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
+        (try! (stx-transfer? (get monthly-price subscription-plan) tx-sender creator))
+        (map-set user-subscriptions {
+            user: tx-sender,
+            creator: creator,
+        } {
+            start-block: start-block,
+            end-block: (+ start-block duration-blocks),
+            price-paid: (get monthly-price subscription-plan),
+        })
+        (map-set creator-subscriptions { creator: creator }
+            (merge subscription-plan { subscriber-count: (+ (get subscriber-count subscription-plan) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (access-content-with-subscription (content-id uint))
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (creator-data (default-to {
+                total-content: u0,
+                total-revenue: u0,
+                total-views: u0,
+            }
+                (map-get? creator-stats { creator: (get creator content) })
+            ))
+        )
+        (asserts! (get active content) ERR-CONTENT-NOT-FOUND)
+        (asserts! (is-subscription-active tx-sender (get creator content))
+            ERR-SUBSCRIPTION-EXPIRED
+        )
+        (map-set contents { content-id: content-id }
+            (merge content { views: (+ (get views content) u1) })
+        )
+        (map-set creator-stats { creator: (get creator content) } {
+            total-content: (get total-content creator-data),
+            total-revenue: (get total-revenue creator-data),
+            total-views: (+ (get total-views creator-data) u1),
+        })
+        (ok true)
+    )
+)
+
+(define-constant ERR-INVALID-RATING (err u108))
+(define-constant ERR-NOT-PURCHASED (err u109))
+(define-constant ERR-ALREADY-REVIEWED (err u110))
+
+(define-map content-ratings
+    { content-id: uint }
+    {
+        total-rating: uint,
+        review-count: uint,
+        average-rating: uint,
+    }
+)
+
+(define-map user-reviews
+    {
+        user: principal,
+        content-id: uint,
+    }
+    {
+        rating: uint,
+        review-text: (string-ascii 256),
+        timestamp: uint,
+    }
+)
+
+(define-map creator-reputation
+    { creator: principal }
+    {
+        total-rating: uint,
+        total-reviews: uint,
+        average-rating: uint,
+    }
+)
+
+(define-read-only (get-content-rating (content-id uint))
+    (map-get? content-ratings { content-id: content-id })
+)
+
+(define-read-only (get-user-review
+        (user principal)
+        (content-id uint)
+    )
+    (map-get? user-reviews {
+        user: user,
+        content-id: content-id,
+    })
+)
+
+(define-read-only (get-creator-reputation (creator principal))
+    (map-get? creator-reputation { creator: creator })
+)
+
+(define-public (rate-content
+        (content-id uint)
+        (rating uint)
+        (review-text (string-ascii 256))
+    )
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (purchase-status (unwrap!
+                (map-get? user-purchases {
+                    user: tx-sender,
+                    content-id: content-id,
+                })
+                ERR-NOT-PURCHASED
+            ))
+            (existing-review (map-get? user-reviews {
+                user: tx-sender,
+                content-id: content-id,
+            }))
+            (current-rating (default-to {
+                total-rating: u0,
+                review-count: u0,
+                average-rating: u0,
+            }
+                (map-get? content-ratings { content-id: content-id })
+            ))
+            (creator-rep (default-to {
+                total-rating: u0,
+                total-reviews: u0,
+                average-rating: u0,
+            }
+                (map-get? creator-reputation { creator: (get creator content) })
+            ))
+        )
+        (asserts! (get purchased purchase-status) ERR-NOT-PURCHASED)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (is-none existing-review) ERR-ALREADY-REVIEWED)
+        (let (
+                (new-review-count (+ (get review-count current-rating) u1))
+                (new-total-rating (+ (get total-rating current-rating) rating))
+                (new-average (/ new-total-rating new-review-count))
+                (new-creator-reviews (+ (get total-reviews creator-rep) u1))
+                (new-creator-total (+ (get total-rating creator-rep) rating))
+                (new-creator-average (/ new-creator-total new-creator-reviews))
+            )
+            (map-set user-reviews {
+                user: tx-sender,
+                content-id: content-id,
+            } {
+                rating: rating,
+                review-text: review-text,
+                timestamp: stacks-block-height,
+            })
+            (map-set content-ratings { content-id: content-id } {
+                total-rating: new-total-rating,
+                review-count: new-review-count,
+                average-rating: new-average,
+            })
+            (map-set creator-reputation { creator: (get creator content) } {
+                total-rating: new-creator-total,
+                total-reviews: new-creator-reviews,
+                average-rating: new-creator-average,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-top-rated-content-by-creator (creator principal))
+    (get-creator-reputation creator)
+)
