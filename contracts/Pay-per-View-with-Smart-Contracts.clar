@@ -130,6 +130,7 @@
             total-revenue: (+ (get total-revenue creator-data) (get price content)),
             total-views: (+ (get total-views creator-data) u1),
         })
+        (unwrap-panic (record-content-activity content-id "purchase"))
         (ok true)
     )
 )
@@ -287,6 +288,7 @@
             total-revenue: (get total-revenue creator-data),
             total-views: (+ (get total-views creator-data) u1),
         })
+        (unwrap-panic (record-content-activity content-id "view"))
         (ok true)
     )
 )
@@ -414,4 +416,196 @@
 
 (define-read-only (get-top-rated-content-by-creator (creator principal))
     (get-creator-reputation creator)
+)
+
+(define-constant ERR-INVALID-TIMEFRAME (err u111))
+
+(define-map trending-metrics
+    { content-id: uint }
+    {
+        views-last-100-blocks: uint,
+        purchases-last-100-blocks: uint,
+        last-activity-block: uint,
+        trending-score: uint,
+    }
+)
+
+(define-map global-trending
+    { rank: uint }
+    {
+        content-id: uint,
+        trending-score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-data-var max-trending-rank uint u20)
+
+(define-read-only (get-trending-metrics (content-id uint))
+    (map-get? trending-metrics { content-id: content-id })
+)
+
+(define-read-only (get-trending-content (rank uint))
+    (map-get? global-trending { rank: rank })
+)
+
+(define-read-only (get-trending-list
+        (start-rank uint)
+        (end-rank uint)
+    )
+    (let (
+            (max-rank (var-get max-trending-rank))
+            (valid-start (if (<= start-rank max-rank)
+                start-rank
+                u1
+            ))
+            (valid-end (if (<= end-rank max-rank)
+                end-rank
+                max-rank
+            ))
+        )
+        (asserts! (<= valid-start valid-end) ERR-INVALID-TIMEFRAME)
+        (ok {
+            start: valid-start,
+            end: valid-end,
+            max-rank: max-rank,
+        })
+    )
+)
+
+(define-private (calculate-trending-score
+        (views-recent uint)
+        (purchases-recent uint)
+        (blocks-since-activity uint)
+    )
+    (let (
+            (view-weight u3)
+            (purchase-weight u10)
+            (decay-factor (if (> blocks-since-activity u100)
+                (/ u100 blocks-since-activity)
+                u100
+            ))
+            (raw-score (+ (* views-recent view-weight) (* purchases-recent purchase-weight)))
+        )
+        (/ (* raw-score decay-factor) u100)
+    )
+)
+
+(define-private (update-trending-score (content-id uint))
+    (let (
+            (current-block stacks-block-height)
+            (current-metrics (default-to {
+                views-last-100-blocks: u0,
+                purchases-last-100-blocks: u0,
+                last-activity-block: u0,
+                trending-score: u0,
+            }
+                (map-get? trending-metrics { content-id: content-id })
+            ))
+            (blocks-since-activity (if (> current-block (get last-activity-block current-metrics))
+                (- current-block (get last-activity-block current-metrics))
+                u0
+            ))
+            (new-score (calculate-trending-score (get views-last-100-blocks current-metrics)
+                (get purchases-last-100-blocks current-metrics)
+                blocks-since-activity
+            ))
+        )
+        (map-set trending-metrics { content-id: content-id }
+            (merge current-metrics { trending-score: new-score })
+        )
+        new-score
+    )
+)
+
+(define-private (record-content-activity
+        (content-id uint)
+        (activity-type (string-ascii 10))
+    )
+    (let (
+            (current-block stacks-block-height)
+            (current-metrics (default-to {
+                views-last-100-blocks: u0,
+                purchases-last-100-blocks: u0,
+                last-activity-block: u0,
+                trending-score: u0,
+            }
+                (map-get? trending-metrics { content-id: content-id })
+            ))
+            (blocks-passed (if (> current-block (get last-activity-block current-metrics))
+                (- current-block (get last-activity-block current-metrics))
+                u0
+            ))
+            (decay-views (if (> blocks-passed u100)
+                u0
+                (get views-last-100-blocks current-metrics)
+            ))
+            (decay-purchases (if (> blocks-passed u100)
+                u0
+                (get purchases-last-100-blocks current-metrics)
+            ))
+            (new-views (if (is-eq activity-type "view")
+                (+ decay-views u1)
+                decay-views
+            ))
+            (new-purchases (if (is-eq activity-type "purchase")
+                (+ decay-purchases u1)
+                decay-purchases
+            ))
+        )
+        (map-set trending-metrics { content-id: content-id } {
+            views-last-100-blocks: new-views,
+            purchases-last-100-blocks: new-purchases,
+            last-activity-block: current-block,
+            trending-score: (calculate-trending-score new-views new-purchases u0),
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-trending-content (content-id uint))
+    (let (
+            (current-metrics (default-to {
+                views-last-100-blocks: u0,
+                purchases-last-100-blocks: u0,
+                last-activity-block: u0,
+                trending-score: u0,
+            }
+                (map-get? trending-metrics { content-id: content-id })
+            ))
+            (current-block stacks-block-height)
+            (blocks-since-activity (if (> current-block (get last-activity-block current-metrics))
+                (- current-block (get last-activity-block current-metrics))
+                u0
+            ))
+            (new-score (calculate-trending-score (get views-last-100-blocks current-metrics)
+                (get purchases-last-100-blocks current-metrics)
+                blocks-since-activity
+            ))
+        )
+        (map-set trending-metrics { content-id: content-id }
+            (merge current-metrics { trending-score: new-score })
+        )
+        (ok new-score)
+    )
+)
+
+(define-public (set-content-trending-rank
+        (content-id uint)
+        (rank uint)
+    )
+    (let (
+            (metrics (unwrap! (map-get? trending-metrics { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (max-rank (var-get max-trending-rank))
+        )
+        (asserts! (<= rank max-rank) ERR-INVALID-TIMEFRAME)
+        (map-set global-trending { rank: rank } {
+            content-id: content-id,
+            trending-score: (get trending-score metrics),
+            last-updated: stacks-block-height,
+        })
+        (ok true)
+    )
 )
