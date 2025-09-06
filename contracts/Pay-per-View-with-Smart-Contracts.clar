@@ -112,6 +112,7 @@
         (asserts! (get active content) ERR-CONTENT-NOT-FOUND)
         (asserts! (is-none purchase-exists) ERR-ALREADY-PURCHASED)
         (try! (stx-transfer? (get price content) tx-sender (get creator content)))
+        (unwrap-panic (distribute-revenue-to-collaborators content-id (get price content)))
         (map-set user-purchases {
             user: tx-sender,
             content-id: content-id,
@@ -419,6 +420,10 @@
 )
 
 (define-constant ERR-INVALID-TIMEFRAME (err u111))
+(define-constant ERR-INVALID-PERCENTAGE (err u112))
+(define-constant ERR-REVENUE-SHARE-EXISTS (err u113))
+(define-constant ERR-MAX-COLLABORATORS (err u114))
+(define-constant ERR-NOT-COLLABORATOR (err u115))
 
 (define-map trending-metrics
     { content-id: uint }
@@ -440,6 +445,29 @@
 )
 
 (define-data-var max-trending-rank uint u20)
+
+(define-map content-revenue-shares
+    { content-id: uint }
+    {
+        collaborators: (list 5 {
+            collaborator: principal,
+            percentage: uint,
+        }),
+        active: bool,
+    }
+)
+
+(define-map collaborator-earnings
+    {
+        collaborator: principal,
+        content-id: uint,
+    }
+    {
+        total-earned: uint,
+        last-withdrawal: uint,
+        pending-amount: uint,
+    }
+)
 
 (define-read-only (get-trending-metrics (content-id uint))
     (map-get? trending-metrics { content-id: content-id })
@@ -607,5 +635,167 @@
             last-updated: stacks-block-height,
         })
         (ok true)
+    )
+)
+
+(define-read-only (get-revenue-shares (content-id uint))
+    (map-get? content-revenue-shares { content-id: content-id })
+)
+
+(define-read-only (get-collaborator-earnings
+        (collaborator principal)
+        (content-id uint)
+    )
+    (map-get? collaborator-earnings {
+        collaborator: collaborator,
+        content-id: content-id,
+    })
+)
+
+(define-private (validate-percentage-total (collaborators (list 5 {
+    collaborator: principal,
+    percentage: uint,
+})))
+    (let ((total-percentage (fold + (map get-percentage collaborators) u0)))
+        (<= total-percentage u100)
+    )
+)
+
+(define-private (get-percentage (collab {
+    collaborator: principal,
+    percentage: uint,
+}))
+    (get percentage collab)
+)
+
+(define-public (setup-revenue-sharing
+        (content-id uint)
+        (collaborators (list 5 {
+            collaborator: principal,
+            percentage: uint,
+        }))
+    )
+    (let ((content (unwrap! (map-get? contents { content-id: content-id })
+            ERR-CONTENT-NOT-FOUND
+        )))
+        (asserts! (is-eq tx-sender (get creator content)) ERR-NOT-AUTHORIZED)
+        (asserts!
+            (is-none (map-get? content-revenue-shares { content-id: content-id }))
+            ERR-REVENUE-SHARE-EXISTS
+        )
+        (asserts! (<= (len collaborators) u5) ERR-MAX-COLLABORATORS)
+        (asserts! (validate-percentage-total collaborators)
+            ERR-INVALID-PERCENTAGE
+        )
+        (map-set content-revenue-shares { content-id: content-id } {
+            collaborators: collaborators,
+            active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-private (distribute-to-collaborator
+        (content-id uint)
+        (revenue uint)
+        (collab {
+            collaborator: principal,
+            percentage: uint,
+        })
+    )
+    (let (
+            (share-amount (/ (* revenue (get percentage collab)) u100))
+            (current-earnings (default-to {
+                total-earned: u0,
+                last-withdrawal: u0,
+                pending-amount: u0,
+            }
+                (map-get? collaborator-earnings {
+                    collaborator: (get collaborator collab),
+                    content-id: content-id,
+                })
+            ))
+        )
+        (map-set collaborator-earnings {
+            collaborator: (get collaborator collab),
+            content-id: content-id,
+        } {
+            total-earned: (+ (get total-earned current-earnings) share-amount),
+            last-withdrawal: (get last-withdrawal current-earnings),
+            pending-amount: (+ (get pending-amount current-earnings) share-amount),
+        })
+        share-amount
+    )
+)
+
+(define-private (distribute-revenue-to-collaborators
+        (content-id uint)
+        (total-revenue uint)
+    )
+    (match (map-get? content-revenue-shares { content-id: content-id })
+        revenue-share (if (get active revenue-share)
+            (begin
+                (map distribute-to-collaborator-helper
+                    (get collaborators revenue-share)
+                )
+                (ok true)
+            )
+            (ok true)
+        )
+        (ok true)
+    )
+)
+
+(define-private (distribute-to-collaborator-helper (collab {
+    collaborator: principal,
+    percentage: uint,
+}))
+    (let (
+            (share-amount u0)
+            (current-earnings (default-to {
+                total-earned: u0,
+                last-withdrawal: u0,
+                pending-amount: u0,
+            }
+                (map-get? collaborator-earnings {
+                    collaborator: (get collaborator collab),
+                    content-id: u0,
+                })
+            ))
+        )
+        (map-set collaborator-earnings {
+            collaborator: (get collaborator collab),
+            content-id: u0,
+        } {
+            total-earned: (+ (get total-earned current-earnings) share-amount),
+            last-withdrawal: (get last-withdrawal current-earnings),
+            pending-amount: (+ (get pending-amount current-earnings) share-amount),
+        })
+        share-amount
+    )
+)
+
+(define-public (withdraw-collaborator-earnings (content-id uint))
+    (let (
+            (earnings (unwrap!
+                (map-get? collaborator-earnings {
+                    collaborator: tx-sender,
+                    content-id: content-id,
+                })
+                ERR-NOT-COLLABORATOR
+            ))
+            (pending (get pending-amount earnings))
+        )
+        (asserts! (> pending u0) ERR-INSUFFICIENT-FUNDS)
+        (try! (as-contract (stx-transfer? pending tx-sender tx-sender)))
+        (map-set collaborator-earnings {
+            collaborator: tx-sender,
+            content-id: content-id,
+        } {
+            total-earned: (get total-earned earnings),
+            last-withdrawal: stacks-block-height,
+            pending-amount: u0,
+        })
+        (ok pending)
     )
 )
