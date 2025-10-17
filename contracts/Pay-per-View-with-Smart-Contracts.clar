@@ -424,6 +424,9 @@
 (define-constant ERR-REVENUE-SHARE-EXISTS (err u113))
 (define-constant ERR-MAX-COLLABORATORS (err u114))
 (define-constant ERR-NOT-COLLABORATOR (err u115))
+(define-constant ERR-GIFT-NOT-FOUND (err u116))
+(define-constant ERR-GIFT-ALREADY-CLAIMED (err u117))
+(define-constant ERR-INVALID-RECIPIENT (err u118))
 
 (define-map trending-metrics
     { content-id: uint }
@@ -797,5 +800,149 @@
             pending-amount: u0,
         })
         (ok pending)
+    )
+)
+
+(define-data-var gift-nonce uint u0)
+
+(define-map content-gifts
+    { gift-id: uint }
+    {
+        content-id: uint,
+        sender: principal,
+        recipient: principal,
+        claimed: bool,
+        timestamp: uint,
+        message: (string-ascii 128),
+    }
+)
+
+(define-map user-gift-stats
+    { user: principal }
+    {
+        gifts-sent: uint,
+        gifts-received: uint,
+        total-value-sent: uint,
+    }
+)
+
+(define-read-only (get-gift (gift-id uint))
+    (map-get? content-gifts { gift-id: gift-id })
+)
+
+(define-read-only (get-user-gift-stats (user principal))
+    (map-get? user-gift-stats { user: user })
+)
+
+(define-public (gift-content
+        (content-id uint)
+        (recipient principal)
+        (message (string-ascii 128))
+    )
+    (let (
+            (content (unwrap! (map-get? contents { content-id: content-id })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (gift-id (var-get gift-nonce))
+            (sender-stats (default-to {
+                gifts-sent: u0,
+                gifts-received: u0,
+                total-value-sent: u0,
+            }
+                (map-get? user-gift-stats { user: tx-sender })
+            ))
+            (recipient-stats (default-to {
+                gifts-sent: u0,
+                gifts-received: u0,
+                total-value-sent: u0,
+            }
+                (map-get? user-gift-stats { user: recipient })
+            ))
+            (creator-data (default-to {
+                total-content: u0,
+                total-revenue: u0,
+                total-views: u0,
+            }
+                (map-get? creator-stats { creator: (get creator content) })
+            ))
+        )
+        (asserts! (get active content) ERR-CONTENT-NOT-FOUND)
+        (asserts! (not (is-eq tx-sender recipient)) ERR-INVALID-RECIPIENT)
+        (try! (stx-transfer? (get price content) tx-sender (get creator content)))
+        (unwrap-panic (distribute-revenue-to-collaborators content-id (get price content)))
+        (map-set content-gifts { gift-id: gift-id } {
+            content-id: content-id,
+            sender: tx-sender,
+            recipient: recipient,
+            claimed: false,
+            timestamp: stacks-block-height,
+            message: message,
+        })
+        (map-set user-gift-stats { user: tx-sender } {
+            gifts-sent: (+ (get gifts-sent sender-stats) u1),
+            gifts-received: (get gifts-received sender-stats),
+            total-value-sent: (+ (get total-value-sent sender-stats) (get price content)),
+        })
+        (map-set user-gift-stats { user: recipient } {
+            gifts-sent: (get gifts-sent recipient-stats),
+            gifts-received: (+ (get gifts-received recipient-stats) u1),
+            total-value-sent: (get total-value-sent recipient-stats),
+        })
+        (map-set contents { content-id: content-id }
+            (merge content { revenue: (+ (get revenue content) (get price content)) })
+        )
+        (map-set creator-stats { creator: (get creator content) } {
+            total-content: (get total-content creator-data),
+            total-revenue: (+ (get total-revenue creator-data) (get price content)),
+            total-views: (get total-views creator-data),
+        })
+        (var-set gift-nonce (+ gift-id u1))
+        (ok gift-id)
+    )
+)
+
+(define-public (claim-gift (gift-id uint))
+    (let (
+            (gift (unwrap! (map-get? content-gifts { gift-id: gift-id })
+                ERR-GIFT-NOT-FOUND
+            ))
+            (content (unwrap! (map-get? contents { content-id: (get content-id gift) })
+                ERR-CONTENT-NOT-FOUND
+            ))
+            (existing-purchase (map-get? user-purchases {
+                user: tx-sender,
+                content-id: (get content-id gift),
+            }))
+            (creator-data (default-to {
+                total-content: u0,
+                total-revenue: u0,
+                total-views: u0,
+            }
+                (map-get? creator-stats { creator: (get creator content) })
+            ))
+        )
+        (asserts! (is-eq tx-sender (get recipient gift)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get claimed gift)) ERR-GIFT-ALREADY-CLAIMED)
+        (asserts! (is-none existing-purchase) ERR-ALREADY-PURCHASED)
+        (map-set content-gifts { gift-id: gift-id }
+            (merge gift { claimed: true })
+        )
+        (map-set user-purchases {
+            user: tx-sender,
+            content-id: (get content-id gift),
+        } {
+            purchased: true,
+            timestamp: stacks-block-height,
+        })
+        (map-set contents { content-id: (get content-id gift) }
+            (merge content { views: (+ (get views content) u1) })
+        )
+        (map-set creator-stats { creator: (get creator content) } {
+            total-content: (get total-content creator-data),
+            total-revenue: (get total-revenue creator-data),
+            total-views: (+ (get total-views creator-data) u1),
+        })
+        (unwrap-panic (record-content-activity (get content-id gift) "purchase"))
+        (ok true)
     )
 )
