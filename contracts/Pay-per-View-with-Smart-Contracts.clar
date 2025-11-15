@@ -946,3 +946,179 @@
         (ok true)
     )
 )
+
+(define-constant PROMO-BPS-DENOM u10000)
+(define-constant PROMO-ERR-UNAUTHORIZED (err u200))
+(define-constant PROMO-ERR-EXISTS (err u201))
+(define-constant PROMO-ERR-NOT-FOUND (err u202))
+(define-constant PROMO-ERR-INACTIVE (err u203))
+(define-constant PROMO-ERR-MAXED (err u205))
+(define-constant PROMO-ERR-ALREADY-USED (err u206))
+(define-constant PROMO-ERR-INVALID-BPS (err u207))
+
+(define-map promo-codes
+    { code-hash: (buff 32) }
+    {
+        creator: principal,
+        discount-bps: uint,
+        max-uses: uint,
+        uses: uint,
+        active: bool,
+    }
+)
+
+(define-map promo-claims
+    {
+        code-hash: (buff 32),
+        user: principal,
+    }
+    { used: bool }
+)
+
+(define-map creator-codes
+    {
+        creator: principal,
+        code-hash: (buff 32),
+    }
+    { exists: bool }
+)
+
+(define-public (promo-register
+        (code (buff 64))
+        (discount-bps uint)
+        (max-uses uint)
+    )
+    (let (
+            (creator tx-sender)
+            (hash (sha256 code))
+            (bdenom PROMO-BPS-DENOM)
+            (existing (map-get? promo-codes { code-hash: hash }))
+        )
+        (asserts! (is-none existing) PROMO-ERR-EXISTS)
+        (asserts! (and (> discount-bps u0) (<= discount-bps bdenom))
+            PROMO-ERR-INVALID-BPS
+        )
+        (map-set promo-codes { code-hash: hash } {
+            creator: creator,
+            discount-bps: discount-bps,
+            max-uses: max-uses,
+            uses: u0,
+            active: true,
+        })
+        (map-set creator-codes {
+            creator: creator,
+            code-hash: hash,
+        } { exists: true }
+        )
+        (ok hash)
+    )
+)
+
+(define-public (promo-set-active
+        (code-hash (buff 32))
+        (active bool)
+    )
+    (let (
+            (entry (unwrap! (map-get? promo-codes { code-hash: code-hash })
+                PROMO-ERR-NOT-FOUND
+            ))
+            (authorized (is-eq (get creator entry) tx-sender))
+        )
+        (asserts! authorized PROMO-ERR-UNAUTHORIZED)
+        (map-set promo-codes { code-hash: code-hash } {
+            creator: (get creator entry),
+            discount-bps: (get discount-bps entry),
+            max-uses: (get max-uses entry),
+            uses: (get uses entry),
+            active: active,
+        })
+        (ok true)
+    )
+)
+
+(define-public (promo-claim (code (buff 64)))
+    (let (
+            (user tx-sender)
+            (hash (sha256 code))
+            (entry (unwrap! (map-get? promo-codes { code-hash: hash })
+                PROMO-ERR-NOT-FOUND
+            ))
+            (used-entry (map-get? promo-claims {
+                code-hash: hash,
+                user: user,
+            }))
+        )
+        (asserts! (get active entry) PROMO-ERR-INACTIVE)
+        (asserts! (is-none used-entry) PROMO-ERR-ALREADY-USED)
+        (asserts! (< (get uses entry) (get max-uses entry)) PROMO-ERR-MAXED)
+        (map-set promo-claims {
+            code-hash: hash,
+            user: user,
+        } { used: true }
+        )
+        (map-set promo-codes { code-hash: hash } {
+            creator: (get creator entry),
+            discount-bps: (get discount-bps entry),
+            max-uses: (get max-uses entry),
+            uses: (+ (get uses entry) u1),
+            active: (get active entry),
+        })
+        (ok (get discount-bps entry))
+    )
+)
+
+(define-read-only (promo-discount-for
+        (code (buff 64))
+        (user principal)
+    )
+    (let (
+            (hash (sha256 code))
+            (entry (map-get? promo-codes { code-hash: hash }))
+            (used-entry (map-get? promo-claims {
+                code-hash: hash,
+                user: user,
+            }))
+        )
+        (match entry
+            promo (if (and
+                    (get active promo)
+                    (is-none used-entry)
+                    (< (get uses promo) (get max-uses promo))
+                )
+                (some (get discount-bps promo))
+                none
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (promo-price-after
+        (price uint)
+        (discount-bps uint)
+    )
+    (let ((bdenom PROMO-BPS-DENOM))
+        (if (> discount-bps bdenom)
+            u0
+            (/ (* price (- bdenom discount-bps)) bdenom)
+        )
+    )
+)
+
+(define-read-only (promo-hash (code (buff 64)))
+    (sha256 code)
+)
+
+(define-read-only (promo-code-info (code-hash (buff 32)))
+    (map-get? promo-codes { code-hash: code-hash })
+)
+
+(define-read-only (promo-has-used
+        (code-hash (buff 32))
+        (user principal)
+    )
+    (is-some (map-get? promo-claims {
+        code-hash: code-hash,
+        user: user,
+    }))
+)
